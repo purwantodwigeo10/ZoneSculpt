@@ -1,0 +1,25 @@
+[general]
+name=ZoneSculpt
+qgisMinimumVersion=3.22
+qgisMaximumVersion=4.99
+description=Batch clip georeferenced rasters with polygon AOI boundaries and flexible output controls.
+version=26.5.0
+author=Dwi Purwanto
+email=ruangspasial@gmail.com
+about=ZoneSculpt clips georeferenced rasters using polygon AOI features, creates a master GeoTIFF for each job, and can export PNG, JPEG, JPEG2000, VRT, or MBTiles outputs. It provides naming-field controls, optional feature grouping, CRS validation and reprojection, overlap preflight checks, progress reporting, and cancellation. Optional output availability depends on the GDAL drivers included with QGIS.
+category=Raster
+icon=icon.png
+homepage=https://github.com/purwantodwigeo10/ZoneSculpt#readme
+tracker=https://github.com/purwantodwigeo10/ZoneSculpt/issues
+repository=https://github.com/purwantodwigeo10/ZoneSculpt
+license=GPL-3.0-or-later
+experimental=False
+deprecated=False
+server=False
+hasProcessingProvider=False
+tags=raster,clip,aoi,geotiff,mbtiles,reprojection,batch
+changelog=26.5.0
+    Added batch raster clipping with polygon AOI boundaries and naming-field controls.
+    Added GeoTIFF master output with optional PNG, JPEG, JPEG2000, VRT, and MBTiles exports.
+    Improved CRS validation, reprojection, overlap checks, progress reporting, and cancellation.
+    Added sample boundary data and clearer usage documentation.
