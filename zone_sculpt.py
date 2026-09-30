@@ -3,6 +3,8 @@
 """ZoneSculpt QGIS plugin: batch raster clipping by polygon boundaries."""
 
 import hashlib
+import hmac
+import json
 import os
 import platform
 import re
@@ -10,8 +12,10 @@ import sqlite3
 import tempfile
 import unicodedata
 import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import defaultdict
-from urllib.parse import urlencode
 
 from qgis.PyQt.QtWidgets import (
     QAction,
@@ -64,15 +68,17 @@ QT_SMOOTH_TRANSFORMATION = _qt_enum("TransformationMode", "SmoothTransformation"
 
 def _dialog_exec(dialog):
     # QGIS 3 / PyQt5 uses exec_(); QGIS 4 / PyQt6 uses exec().
-    if hasattr(dialog, "exec"):
-        return dialog.exec()
-    return dialog.exec_()
+    exec_method = getattr(dialog, "exec", None)
+    if exec_method is None:
+        exec_method = getattr(dialog, "exec_")
+    return exec_method()
 
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsFeature,
     QgsGeometry,
+    QgsMapLayerStyle,
     QgsMapLayerProxyModel,
     QgsMessageLog,
     QgsProcessingFeedback,
@@ -88,18 +94,33 @@ from qgis.gui import QgsFieldComboBox, QgsMapLayerComboBox, QgsProjectionSelecti
 
 import processing
 
-from .license_network import request_json
+
+def _qgis_enum(owner, group_name, value_name):
+    """Resolve QGIS 3 unscoped and newer scoped enum values."""
+    if hasattr(owner, value_name):
+        return getattr(owner, value_name)
+    group = getattr(owner, group_name, None)
+    if group is not None and hasattr(group, value_name):
+        return getattr(group, value_name)
+    raise AttributeError(f"QGIS enum not found: {group_name}.{value_name}")
+
+
+WKB_POLYGON_GEOMETRY = _qgis_enum(QgsWkbTypes, "GeometryType", "PolygonGeometry")
+QGIS_WARNING = _qgis_enum(Qgis, "MessageLevel", "Warning")
+QGIS_CRITICAL = _qgis_enum(Qgis, "MessageLevel", "Critical")
+VECTOR_WRITER_NO_ERROR = _qgis_enum(QgsVectorFileWriter, "WriterError", "NoError")
+LAYER_FILTER_RASTER = _qgis_enum(QgsMapLayerProxyModel, "Filter", "RasterLayer")
+LAYER_FILTER_POLYGON = _qgis_enum(QgsMapLayerProxyModel, "Filter", "PolygonLayer")
 
 
 PLUGIN_NAME = "ZoneSculpt"
 PLUGIN_CODE = "ZS"
-PLUGIN_VERSION = "26.5.0"
+PLUGIN_VERSION = "26.01"
 PLUGIN_COMPAT_MIN_QGIS = "3.22"
-PLUGIN_COMPAT_MAX_QGIS = "4.99"
+PLUGIN_COMPAT_MAX_QGIS = "3.99"
 
 DEFAULT_ACTIVATION_SERVER_URL = "https://aktivasi.ruangspasial.my.id"
 REQUEST_ACTIVATION_URL = "https://aktivasi.ruangspasial.my.id/request"
-USER_GUIDE_URL = "https://github.com/purwantodwigeo10/ZoneSculpt#readme"
 
 
 OUTPUT_FORMATS = [
@@ -138,6 +159,13 @@ OUTPUT_FORMATS = [
         "options": "",
         "note": "Optional virtual raster export. The master GeoTIFF must remain available.",
     },
+    {
+        "label": "Tiled GeoPackage (.gpkg) - Keeps Target CRS",
+        "key": "gpkg",
+        "ext": ".gpkg",
+        "options": "TILE_FORMAT=PNG",
+        "note": "Tiled raster database that keeps the selected Target CRS. Use this when MBTiles EPSG:3857 is not suitable.",
+    },
 ]
 COMMON_INPUT_RASTER_EXTS = {
     ".tif",
@@ -161,34 +189,25 @@ COMMON_INPUT_RASTER_EXTS = {
 
 
 class ActivationManager:
-    """RUANG SPASIAL License Hub activation with 5 successful export trials.
-
-    Important rule:
-    - Trial is only allowed before a license has ever been activated on this device.
-    - After a license exists, every run must be confirmed by License Hub.
-    - If the license is blocked, deleted, revoked, expired, or rejected by the server,
-      ZoneSculpt is locked and cannot fall back to trial.
-    """
+    """Simple per-device offline activation with 5 successful export trials."""
 
     TRIAL_LIMIT = 5
+    SECRET_KEY = b"ZoneSculpt_DwiPurwanto_Activation_v1_ChangeThisSecretBeforeRelease"
 
     def __init__(self):
         self.settings = QSettings("DwiPurwanto", "ZoneSculptLicenseHubV2")
+        # Paksa migrasi dari versi testing yang pernah menyimpan localhost/127.0.0.1.
+        # Jika nilai lama dibiarkan, Windows akan menampilkan WinError 10061.
         saved_url = str(self.settings.value("activation_server_url", "") or "").strip()
-        if saved_url.rstrip("/") != DEFAULT_ACTIVATION_SERVER_URL:
+        if (not saved_url) or ("127.0.0.1" in saved_url) or ("localhost" in saved_url) or (":8000" in saved_url) or (":8001" in saved_url):
             self.settings.setValue("activation_server_url", DEFAULT_ACTIVATION_SERVER_URL)
             self.settings.sync()
 
     def server_url(self):
-        saved_url = str(
-            self.settings.value(
-                "activation_server_url", DEFAULT_ACTIVATION_SERVER_URL
-            )
-            or DEFAULT_ACTIVATION_SERVER_URL
-        ).strip().rstrip("/")
-        if saved_url != DEFAULT_ACTIVATION_SERVER_URL:
+        saved_url = str(self.settings.value("activation_server_url", DEFAULT_ACTIVATION_SERVER_URL) or DEFAULT_ACTIVATION_SERVER_URL).strip().rstrip("/")
+        if (not saved_url) or ("127.0.0.1" in saved_url) or ("localhost" in saved_url) or (":8000" in saved_url) or (":8001" in saved_url):
             saved_url = DEFAULT_ACTIVATION_SERVER_URL
-            self.settings.setValue("activation_server_url", DEFAULT_ACTIVATION_SERVER_URL)
+            self.settings.setValue("activation_server_url", saved_url)
             self.settings.sync()
         return saved_url
 
@@ -196,86 +215,26 @@ class ActivationManager:
         return str(self.settings.value("license_key", "") or "")
 
     def request_activation_url(self):
-        params = urlencode({
+        params = urllib.parse.urlencode({
             "plugin_code": PLUGIN_CODE,
             "plugin": PLUGIN_NAME,
-            "product_code": PLUGIN_CODE,
-            "product_name": PLUGIN_NAME,
             "device_id": self.device_id(),
         })
         return f"{REQUEST_ACTIVATION_URL}?{params}"
 
-    def _to_bool(self, value):
-        return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-    def license_was_activated(self):
-        return self._to_bool(self.settings.value("license_was_activated", False))
-
-    def is_license_locked(self):
-        return self._to_bool(self.settings.value("license_locked", False))
-
-    def lock_reason(self):
-        return str(self.settings.value("license_lock_reason", "License is no longer active or valid.") or "License is no longer active or valid.")
-
-    def block_activation(self, reason):
-        """Lock plugin when License Hub rejects a license. Trial must not be reused."""
-        reason = str(reason or "License is no longer active or valid.").strip()
-        self.settings.setValue("license_was_activated", True)
-        self.settings.setValue("license_locked", True)
-        self.settings.setValue("license_lock_reason", reason)
-        # Keep license_key so Refresh Status can re-check it if admin re-activates it.
-        self.settings.remove("activation_token")
-        self.settings.remove("activation_expires")
-        self.settings.sync()
-
-    def clear_activation(self, keep_history=True):
+    def clear_activation(self):
         for key in ["license_key", "activated_device", "activation_token", "activation_expires", "activation_code"]:
             try:
                 self.settings.remove(key)
             except Exception:
                 self.settings.setValue(key, "")
-        self.settings.setValue("license_locked", False)
-        self.settings.setValue("license_lock_reason", "")
-        if not keep_history:
-            self.settings.setValue("license_was_activated", False)
         self.settings.sync()
 
-    @staticmethod
-    def _response_is_active(result):
-        if not isinstance(result, dict):
-            return False
-        status = str(
-            result.get("status")
-            or result.get("license_status")
-            or result.get("state")
-            or ""
-        ).strip().upper()
-        inactive_statuses = {
-            "BLOCKED",
-            "DEACTIVATED",
-            "INACTIVE",
-            "REVOKED",
-            "REJECTED",
-            "DISABLED",
-            "DELETED",
-            "REMOVED",
-            "NOT_FOUND",
-            "EXPIRED",
-        }
-        if status in inactive_statuses:
-            return False
-        response_flags = ("ok", "success", "active", "valid", "approved")
-        if any(result.get(key) is False for key in response_flags):
-            return False
-        return (
-            any(result.get(key) is True for key in response_flags)
-            or status in {"ACTIVE", "APPROVED"}
-        )
-
     def activate_with_server(self, server_url, license_key):
-        del server_url
-        server_url = DEFAULT_ACTIVATION_SERVER_URL
+        server_url = (server_url or "").strip().rstrip("/")
         license_key = (license_key or "").strip().upper()
+        if not server_url:
+            return False, "Activation server URL is empty."
         if not license_key:
             return False, "License key is empty."
 
@@ -287,43 +246,47 @@ class ActivationManager:
             "license_key": license_key,
             "machine_name": platform.node(),
         }
-        result, error = request_json(
-            "POST",
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
             endpoint,
-            payload,
-            timeout=15,
-            user_agent=f"ZoneSculpt-QGIS/{PLUGIN_VERSION}",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-        if result is None:
-            return False, error or "Cannot connect to the License Hub."
-        if not isinstance(result, dict):
-            return False, "License Hub returned an invalid response."
-        if not self._response_is_active(result):
-            return False, result.get("message") or result.get("detail") or "Activation was rejected by the server."
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+                result = json.loads(raw or "{}")
+        except urllib.error.HTTPError as exc:
+            try:
+                raw = exc.read().decode("utf-8", errors="replace")
+                result = json.loads(raw or "{}")
+                return False, result.get("message") or result.get("detail") or str(exc)
+            except Exception:
+                return False, f"Activation server returned an error: {exc}"
+        except Exception as exc:
+            return False, f"Tidak bisa terhubung ke server aktivasi ({endpoint}). Detail: {exc}"
+
+        if not result.get("ok"):
+            return False, result.get("message", "Activation was rejected by the server.")
 
         self.settings.setValue("activation_server_url", server_url)
         self.settings.setValue("license_key", license_key)
         self.settings.setValue("activated_device", self.device_id())
         self.settings.setValue("activation_token", result.get("activation_token", "SERVER_OK"))
         self.settings.setValue("activation_expires", result.get("expires", "PERMANENT"))
-        self.settings.setValue("license_was_activated", True)
-        self.settings.setValue("license_locked", False)
-        self.settings.setValue("license_lock_reason", "")
         self.settings.sync()
         return True, result.get("message", "Activation successful.")
 
     def verify_activation_with_server(self):
         license_key = self.license_key().strip().upper()
         if not license_key:
-            if self.license_was_activated():
-                self.block_activation("License has been removed from this device. Please activate again with a valid License Hub code.")
-                return False, self.lock_reason()
-            return False, "No activation code is stored. Submit a request or enter an activation code."
+            self.clear_activation()
+            return False, "Kode aktivasi belum tersimpan. Silakan aktivasi ulang."
 
-        activated_device = str(self.settings.value("activated_device", "") or "")
-        if activated_device and activated_device != self.device_id():
-            self.block_activation("This activation belongs to another device. Please submit a new activation request.")
-            return False, self.lock_reason()
+        if str(self.settings.value("activated_device", "") or "") != self.device_id():
+            self.clear_activation()
+            return False, "Aktivasi bukan untuk perangkat ini. Silakan ajukan request aktivasi baru."
 
         server_url = self.server_url().strip().rstrip("/")
         endpoint = f"{server_url}/activate"
@@ -335,53 +298,47 @@ class ActivationManager:
             "machine_name": platform.node(),
             "check_only": True,
         }
-        result, error = request_json(
-            "POST",
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
             endpoint,
-            payload,
-            timeout=12,
-            user_agent=f"ZoneSculpt-QGIS/{PLUGIN_VERSION}",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-        if result is None:
-            return False, error or (
-                "Cannot verify license status with License Hub. "
-                "Connect to the internet and try again."
-            )
-        if not isinstance(result, dict):
-            return False, "License Hub returned an invalid response."
-        if not self._response_is_active(result):
-            msg = result.get("message") or result.get("detail") or "License is no longer active or valid."
-            self.block_activation(msg)
+
+        try:
+            with urllib.request.urlopen(request, timeout=12) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+                result = json.loads(raw or "{}")
+        except urllib.error.HTTPError as exc:
+            try:
+                raw = exc.read().decode("utf-8", errors="replace")
+                result = json.loads(raw or "{}")
+                msg = result.get("message") or result.get("detail") or str(exc)
+            except Exception:
+                msg = f"Server menolak lisensi: {exc}"
+            self.clear_activation()
             return False, msg
+        except Exception as exc:
+            return False, f"Tidak bisa mengecek status lisensi ke server. Sambungkan internet lalu coba lagi. Detail: {exc}"
+
+        if not result.get("ok"):
+            self.clear_activation()
+            return False, result.get("message", "Lisensi sudah tidak aktif atau tidak valid.")
 
         self.settings.setValue("activation_token", result.get("activation_token", str(self.settings.value("activation_token", "SERVER_OK") or "SERVER_OK")))
         self.settings.setValue("activation_expires", result.get("expires", str(self.settings.value("activation_expires", "PERMANENT") or "PERMANENT")))
         self.settings.setValue("activated_device", self.device_id())
         self.settings.setValue("license_key", license_key)
-        self.settings.setValue("license_was_activated", True)
-        self.settings.setValue("license_locked", False)
-        self.settings.setValue("license_lock_reason", "")
         self.settings.sync()
-        return True, result.get("message", "License is active.")
+        return True, result.get("message", "Lisensi aktif.")
 
     def ensure_can_run(self):
-        # If a previous License Hub license has been blocked/deleted/revoked,
-        # do not ever fall back to trial mode on the same stored activation.
-        if self.is_license_locked():
-            return False, self.lock_reason()
-
-        has_license_record = bool(
-            self.license_key().strip()
-            or str(self.settings.value("activated_device", "") or "").strip()
-            or str(self.settings.value("activation_token", "") or "").strip()
-            or self.license_was_activated()
-        )
-        if has_license_record:
+        if self.is_activated():
             return self.verify_activation_with_server()
-
         if self.trial_remaining() > 0:
-            return True, f"Trial remaining: {self.trial_remaining()} of {self.TRIAL_LIMIT}."
-        return False, "The 5-use trial has expired. Submit an activation request in RUANG SPASIAL License Hub, then enter the activation code."
+            return True, f"Trial tersisa {self.trial_remaining()} dari {self.TRIAL_LIMIT}."
+        return False, "Trial 5 kali penggunaan sudah habis. Silakan ajukan aktivasi di website RUANG SPASIAL, lalu masukkan kode aktivasi."
 
     def device_id(self):
         parts = [platform.system(), platform.node(), str(uuid.getnode())]
@@ -410,34 +367,22 @@ class ActivationManager:
         return max(0, self.TRIAL_LIMIT - self.trial_used())
 
     def is_activated(self):
-        # Only a license confirmed by the RUANG SPASIAL License Hub is active.
-        # Legacy offline codes are intentionally ignored to prevent stale status.
-        if self.is_license_locked():
-            return False
+        # Hanya license dari RUANG SPASIAL License Hub yang dianggap aktif.
+        # Kode aktivasi offline/legacy sengaja tidak dipakai supaya status tidak salah "Active".
         license_key = self.license_key().strip().upper()
         token = str(self.settings.value("activation_token", "") or "")
         activated_device = str(self.settings.value("activated_device", "") or "")
         return bool(license_key and token and activated_device == self.device_id())
 
     def can_run(self):
-        if self.is_license_locked():
-            return False
-        if self.license_was_activated() or self.license_key().strip():
-            return self.is_activated()
-        return self.trial_remaining() > 0
+        return self.is_activated() or self.trial_remaining() > 0
 
     def status_text(self):
-        if self.is_license_locked():
-            return "Inactive - License Locked"
         if self.is_activated():
             return "Active"
-        if self.license_was_activated() or self.license_key().strip():
-            return "Inactive - Verification Required"
         if self.trial_remaining() <= 0:
-            return "Inactive - Trial Expired"
-        return "Trial - %s of %s uses remaining" % (
-            self.trial_remaining(), self.TRIAL_LIMIT
-        )
+            return "Belum Aktif - Trial Habis"
+        return "Belum Aktif"
 
     def status_color(self):
         if self.is_activated():
@@ -445,19 +390,53 @@ class ActivationManager:
         return "#c62828"
 
     def record_successful_export(self):
-        # Trial counter only applies before License Hub activation.
-        if self.is_activated() or self.license_was_activated() or self.license_key().strip() or self.is_license_locked():
+        if self.is_activated():
             return
         used = min(self.TRIAL_LIMIT, self.trial_used() + 1)
         self.settings.setValue("trial_used", used)
         self.settings.sync()
+
+    def activation_payload(self, device_id=None):
+        device_id = (device_id or self.device_id()).strip().upper()
+        return f"ZS|{device_id}|PERMANENT|V1"
+
+    def expected_signature(self, device_id=None):
+        payload = self.activation_payload(device_id)
+        return hmac.new(self.SECRET_KEY, payload.encode("utf-8"), hashlib.sha256).hexdigest().upper()[:16]
+
+    def format_code(self, device_id=None):
+        device_id = (device_id or self.device_id()).strip().upper().replace("-", "")
+        signature = self.expected_signature(device_id)
+        raw = f"{device_id}{signature}"
+        groups = [raw[i:i + 4] for i in range(0, len(raw), 4)]
+        return "ZS-" + "-".join(groups)
+
+    def verify_code(self, code):
+        cleaned = re.sub(r"[^A-Za-z0-9]", "", str(code or "")).upper()
+        if cleaned.startswith("ZS"):
+            cleaned = cleaned[2:]
+        if len(cleaned) != 32:
+            return False
+        code_device = cleaned[:16]
+        code_sig = cleaned[16:]
+        if code_device != self.device_id():
+            return False
+        return hmac.compare_digest(code_sig, self.expected_signature(code_device))
+
+    def activate(self, code):
+        if not self.verify_code(code):
+            return False
+        self.settings.setValue("activation_code", code.strip().upper())
+        self.settings.setValue("activated_device", self.device_id())
+        self.settings.sync()
+        return True
 
 
 class ActivationDialog(QDialog):
     def __init__(self, activation_manager, parent=None):
         super().__init__(parent)
         self.activation_manager = activation_manager
-        self.setWindowTitle("ZoneSculpt - Manage Activation")
+        self.setWindowTitle("Aktivasi ZoneSculpt")
         self.setMinimumWidth(700)
 
         layout = QVBoxLayout(self)
@@ -465,7 +444,7 @@ class ActivationDialog(QDialog):
 
         self.status_label = QLabel("")
         self.status_label.setTextFormat(QT_RICH_TEXT)
-        form.addRow("Activation Status", self.status_label)
+        form.addRow("Status Aktivasi", self.status_label)
 
         device_row = QWidget()
         device_layout = QHBoxLayout(device_row)
@@ -473,33 +452,30 @@ class ActivationDialog(QDialog):
         self.device_id_edit = QLineEdit(self.activation_manager.device_id())
         self.device_id_edit.setReadOnly(True)
         self.device_id_edit.setMinimumWidth(360)
-        self.copy_device_button = QPushButton("Copy Device ID")
+        self.copy_device_button = QPushButton("Salin Device ID")
         self.copy_device_button.clicked.connect(self._copy_device_id)
         device_layout.addWidget(self.device_id_edit)
         device_layout.addWidget(self.copy_device_button)
         form.addRow("Device ID", device_row)
 
         self.trial_label = QLabel("")
-        form.addRow("Trial Usage", self.trial_label)
+        form.addRow("Pemakaian Trial", self.trial_label)
 
         self.code_edit = QLineEdit()
-        self.code_edit.setPlaceholderText("Paste the activation code from RUANG SPASIAL License Hub")
-        form.addRow("Activation Code", self.code_edit)
+        self.code_edit.setPlaceholderText("Masukkan kode aktivasi dari License Hub")
+        form.addRow("Kode Aktivasi", self.code_edit)
         layout.addLayout(form)
 
         button_row = QHBoxLayout()
         button_row.addStretch()
-        self.request_button = QPushButton("Submit Request")
+        self.request_button = QPushButton("Ajukan Request")
         self.request_button.clicked.connect(self._open_request_page)
-        self.activate_button = QPushButton("Activate")
+        self.activate_button = QPushButton("Aktifkan")
         self.activate_button.clicked.connect(self._activate)
-        self.refresh_button = QPushButton("Refresh Status")
-        self.refresh_button.clicked.connect(self._refresh_from_server)
-        self.close_button = QPushButton("Close")
+        self.close_button = QPushButton("Tutup")
         self.close_button.clicked.connect(self.accept)
         button_row.addWidget(self.request_button)
         button_row.addWidget(self.activate_button)
-        button_row.addWidget(self.refresh_button)
         button_row.addWidget(self.close_button)
         layout.addLayout(button_row)
 
@@ -507,7 +483,7 @@ class ActivationDialog(QDialog):
 
     def _copy_device_id(self):
         QApplication.clipboard().setText(self.device_id_edit.text())
-        QMessageBox.information(self, PLUGIN_NAME, "Device ID copied to clipboard.")
+        QMessageBox.information(self, PLUGIN_NAME, "Device ID berhasil disalin ke clipboard.")
 
     def _open_request_page(self):
         QApplication.clipboard().setText(self.activation_manager.device_id())
@@ -515,51 +491,30 @@ class ActivationDialog(QDialog):
         QMessageBox.information(
             self,
             PLUGIN_NAME,
-            "The activation request page has been opened and the Device ID has been copied to the clipboard.",
+            "Halaman request aktivasi sudah dibuka. Device ID juga sudah disalin ke clipboard.",
         )
 
     def _activate(self):
         code = self.code_edit.text().strip()
         if not code:
-            QMessageBox.warning(self, PLUGIN_NAME, "Enter the activation code first.")
+            QMessageBox.warning(self, PLUGIN_NAME, "Masukkan kode aktivasi terlebih dahulu.")
             return
 
         ok, message = self.activation_manager.activate_with_server(self.activation_manager.server_url(), code)
         if ok:
-            QMessageBox.information(self, PLUGIN_NAME, message or "Activation successful. ZoneSculpt is active on this device.")
+            QMessageBox.information(self, PLUGIN_NAME, message or "Aktivasi berhasil. ZoneSculpt sudah aktif pada perangkat ini.")
             self._refresh()
             self.accept()
             return
 
         QMessageBox.critical(self, PLUGIN_NAME, message or "Aktivasi gagal. Pastikan kode aktivasi, plugin code, dan Device ID cocok.")
 
-    def _refresh_from_server(self):
-        if not (self.activation_manager.is_activated() or self.activation_manager.license_key().strip() or self.activation_manager.is_license_locked()):
-            self._refresh()
-            QMessageBox.information(
-                self,
-                PLUGIN_NAME,
-                "No active license is stored. Submit a request or enter an activation code.",
-            )
-            return
-
-        ok, message = self.activation_manager.verify_activation_with_server()
-        self._refresh()
-        if ok:
-            QMessageBox.information(self, PLUGIN_NAME, message or "License status is active.")
-        else:
-            QMessageBox.warning(self, PLUGIN_NAME, message or "The license is no longer active, valid, or reachable.")
-
     def _refresh(self):
         color = self.activation_manager.status_color()
-        self.status_label.setText(
-            f"<span style='font-weight:700; color:{color};'>{self.activation_manager.status_text()}</span>"
-        )
+        self.status_label.setText(f"<span style='font-weight:700; color:{color};'>{self.activation_manager.status_text()}</span>")
         used = self.activation_manager.trial_used()
         remaining = self.activation_manager.trial_remaining()
-        self.trial_label.setText(
-            f"{used}/{self.activation_manager.TRIAL_LIMIT} used, {remaining} remaining"
-        )
+        self.trial_label.setText(f"{used}/{self.activation_manager.TRIAL_LIMIT} dipakai, {remaining} tersisa")
 
 
 class ZoneSculptDialog(QDialog):
@@ -620,7 +575,7 @@ class ZoneSculptDialog(QDialog):
         header_text_layout.addWidget(self.title_label, 0, QT_ALIGN_TOP)
 
         self.subtitle_label = QLabel(
-            "ZoneSculpt performs batch raster clipping using polygon AOI boundaries. "
+            "ZoneSculpt helps users perform batch raster and vector clipping based on polygon AOI quickly and efficiently. "
             "It supports various GIS data formats and simplifies output naming, file format selection, and CRS management."
         )
         self.subtitle_label.setWordWrap(True)
@@ -642,10 +597,6 @@ class ZoneSculptDialog(QDialog):
         self.manage_button = QPushButton("Manage Activation")
         self.manage_button.clicked.connect(self._manage_activation)
         right_layout.addWidget(self.manage_button, 0, QT_ALIGN_RIGHT)
-
-        self.user_guide_button = QPushButton("User Guide and Activation")
-        self.user_guide_button.clicked.connect(self._open_user_guide)
-        right_layout.addWidget(self.user_guide_button, 0, QT_ALIGN_RIGHT)
         header_layout.addWidget(right_box, 0, QT_ALIGN_TOP)
 
         layout.addWidget(self.header_frame)
@@ -653,13 +604,13 @@ class ZoneSculptDialog(QDialog):
         form = QFormLayout()
 
         self.raster_combo = QgsMapLayerComboBox()
-        self.raster_combo.setFilters(QgsMapLayerProxyModel.RasterLayer)
+        self.raster_combo.setFilters(LAYER_FILTER_RASTER)
         self.raster_file_button = QPushButton("Add from file...")
         self.raster_file_button.clicked.connect(self._browse_raster_file)
         form.addRow("Input Raster", self._row(self.raster_combo, self.raster_file_button))
 
         self.aoi_combo = QgsMapLayerComboBox()
-        self.aoi_combo.setFilters(QgsMapLayerProxyModel.PolygonLayer)
+        self.aoi_combo.setFilters(LAYER_FILTER_POLYGON)
         self.aoi_file_button = QPushButton("Add from file...")
         self.aoi_file_button.clicked.connect(self._browse_aoi_file)
         form.addRow("Clip Boundary", self._row(self.aoi_combo, self.aoi_file_button))
@@ -731,7 +682,9 @@ class ZoneSculptDialog(QDialog):
         export_mbtiles_layout = QHBoxLayout(export_mbtiles_row)
         export_mbtiles_layout.setContentsMargins(0, 0, 0, 0)
         self.export_mbtiles_check = QCheckBox("Also Export to MBTiles")
-        self.mbtiles_note_label = QLabel("MBTiles export uses PNG tiles for best compatibility.")
+        self.mbtiles_note_label = QLabel(
+            "MBTiles uses PNG tiles and EPSG:3857 for compatibility. Other outputs use the selected Target CRS."
+        )
         self.mbtiles_note_label.setWordWrap(True)
         export_mbtiles_layout.addWidget(self.export_mbtiles_check)
         export_mbtiles_layout.addWidget(self.mbtiles_note_label)
@@ -743,6 +696,8 @@ class ZoneSculptDialog(QDialog):
         layout.addWidget(self.info_label)
 
         self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setFormat("%p%")
         self.progress.setValue(0)
         layout.addWidget(self.progress)
 
@@ -778,31 +733,11 @@ class ZoneSculptDialog(QDialog):
             f"<span style='color:{color};'>{extra_text}</span><br>"
             f"<span style='font-weight:700; color:{activation_color};'>Activation : {activation_text}</span>"
         )
-        self._sync_activation_controls()
-
-    def _sync_activation_controls(self):
-        if not hasattr(self, "run_button") or self.is_running:
-            return
-        can_run_locally = self.activation_manager.can_run()
-        self.run_button.setEnabled(can_run_locally)
-        if not can_run_locally and hasattr(self, "status_label"):
-            if self.activation_manager.is_license_locked():
-                self.status_label.setText(
-                    "ZoneSculpt is locked because the License Hub license is inactive, blocked, deleted, or revoked. "
-                    "Open Manage Activation, refresh the status, or activate using a valid License Hub code."
-                )
-            elif self.activation_manager.trial_remaining() <= 0:
-                self.status_label.setText(
-                    "Trial has expired. Open Manage Activation to submit a request or enter an activation code."
-                )
 
     def _manage_activation(self):
         dialog = ActivationDialog(self.activation_manager, self)
         _dialog_exec(dialog)
         self._set_header_status("Ready", "Background Mode: Enabled", "#0a7a33")
-
-    def _open_user_guide(self):
-        QDesktopServices.openUrl(QUrl(USER_GUIDE_URL))
 
     def _request_cancel(self):
         if not self.is_running:
@@ -882,7 +817,7 @@ class ZoneSculptDialog(QDialog):
                 "The AOI cannot be opened. For GPKG/KML files with multiple layers, open the polygon layer in QGIS first, then select it in ZoneSculpt.",
             )
             return
-        if QgsWkbTypes.geometryType(layer.wkbType()) != QgsWkbTypes.PolygonGeometry:
+        if QgsWkbTypes.geometryType(layer.wkbType()) != WKB_POLYGON_GEOMETRY:
             QMessageBox.warning(self, PLUGIN_NAME, "AOI must be a polygon or multipolygon layer.")
             return
         QgsProject.instance().addMapLayer(layer)
@@ -1008,19 +943,26 @@ class ZoneSculptPlugin:
         self.dialog.run_button.clicked.connect(self.execute_clip)
         self.dialog.show()
 
-    def execute_clip(self):
+    def execute_clip(self, checked=False):
         dlg = self.dialog
+        dlg.progress.setRange(0, 100)
+        dlg.progress.setValue(0)
+        dlg.status_label.setText("Starting: checking activation and input settings...")
+        QApplication.processEvents()
+
         can_run, activation_message = self.activation_manager.ensure_can_run()
         if not can_run:
-            dlg._set_header_status("Locked", "Activation required", "#c62828")
             QMessageBox.warning(
                 dlg,
                 PLUGIN_NAME,
-                (activation_message or "Plugin is not active.")
-                + "\n\nClick OK to open Manage Activation."
+                (activation_message or "Plugin belum aktif.")
+                + "\n\nKlik OK untuk membuka dialog aktivasi/request."
             )
             dlg._manage_activation()
             return
+        dlg.progress.setValue(5)
+        QApplication.processEvents()
+
         raster = dlg.raster_combo.currentLayer()
         aoi = dlg.aoi_combo.currentLayer()
         field_name = dlg.field_combo.currentField()
@@ -1032,7 +974,6 @@ class ZoneSculptPlugin:
         reproject_output = dlg.reproject_check.isChecked()
         output_format = dlg.output_format_combo.currentData() or OUTPUT_FORMATS[0]
         export_mbtiles = dlg.export_mbtiles_check.isChecked()
-        mbtiles_options = "TILE_FORMAT=PNG"
         source_crs = dlg.source_crs_selector.crs()
         mask_crs = dlg.mask_crs_selector.crs()
         output_crs = dlg.output_crs_selector.crs()
@@ -1057,7 +998,7 @@ class ZoneSculptPlugin:
         if aoi is None:
             QMessageBox.warning(dlg, PLUGIN_NAME, "Please select a clip boundary layer first.")
             return
-        if QgsWkbTypes.geometryType(aoi.wkbType()) != QgsWkbTypes.PolygonGeometry:
+        if QgsWkbTypes.geometryType(aoi.wkbType()) != WKB_POLYGON_GEOMETRY:
             QMessageBox.warning(dlg, PLUGIN_NAME, "The clip boundary layer must be polygon or multipolygon.")
             return
         if not field_name:
@@ -1079,12 +1020,25 @@ class ZoneSculptPlugin:
         if reproject_output and not dlg._is_usable_crs(output_crs):
             QMessageBox.warning(dlg, PLUGIN_NAME, "Target CRS is LOCAL/unsupported. Please select a real target CRS or disable Reproject Output.")
             return
+
+        # This CRS is authoritative for the GeoTIFF master and every optional
+        # non-MBTiles export.  Earlier builds used Boundary CRS when
+        # reprojection was disabled, which could silently change coordinates
+        # whenever the raster and AOI used different CRSs.
+        effective_output_crs = output_crs if reproject_output else source_crs
+        if not dlg._is_usable_crs(effective_output_crs):
+            QMessageBox.warning(dlg, PLUGIN_NAME, "The effective output CRS is invalid. Please check Source CRS and Target CRS.")
+            return
         if not os.path.isdir(output_folder):
             try:
                 os.makedirs(output_folder, exist_ok=True)
             except Exception as exc:
                 QMessageBox.critical(dlg, PLUGIN_NAME, f"Output directory cannot be created:\n{exc}")
                 return
+
+        dlg.progress.setValue(10)
+        dlg.status_label.setText("Reading polygon boundaries...")
+        QApplication.processEvents()
 
         if aoi.selectedFeatureCount() > 0 and use_selected:
             features = list(aoi.selectedFeatures())
@@ -1095,17 +1049,24 @@ class ZoneSculptPlugin:
             QMessageBox.warning(dlg, PLUGIN_NAME, "The clip boundary layer has no features to process.")
             return
 
+        dlg.progress.setValue(15)
+        dlg.status_label.setText("Preparing clipping jobs and checking raster overlap...")
+        QApplication.processEvents()
+
         # Non-blocking overlap check. Some ECW/LOCAL CRS rasters cannot be reliably
         # checked by QGIS before GDAL runs, even though clipping can still work.
         # We only log a warning and continue to the actual GDAL clip step.
         try:
             overlap_ok, overlap_message = self._preflight_overlap_check(raster, aoi, features, source_crs, mask_crs)
             if not overlap_ok:
-                QgsMessageLog.logMessage(f"Preflight warning ignored: {overlap_message}", PLUGIN_NAME, Qgis.Warning)
+                QgsMessageLog.logMessage(f"Preflight warning ignored: {overlap_message}", PLUGIN_NAME, QGIS_WARNING)
         except Exception as exc:
-            QgsMessageLog.logMessage(f"Preflight check skipped: {exc}", PLUGIN_NAME, Qgis.Warning)
+            QgsMessageLog.logMessage(f"Preflight check skipped: {exc}", PLUGIN_NAME, QGIS_WARNING)
 
         jobs = self._build_jobs(features, field_name, group_by_field)
+        if not jobs:
+            QMessageBox.warning(dlg, PLUGIN_NAME, "No clipping job could be created from the selected boundaries.")
+            return
         used_names = set()
         outputs = []
         warnings = []
@@ -1117,8 +1078,8 @@ class ZoneSculptPlugin:
         dlg.current_feedback = None
         dlg.run_button.setEnabled(False)
         dlg.cancel_button.setEnabled(True)
-        dlg.progress.setMaximum(len(jobs))
-        dlg.progress.setValue(0)
+        dlg.progress.setRange(0, 100)
+        dlg.progress.setValue(20)
         dlg._set_header_status("Running", "Clip to GeoTIFF master, then export", "#b36b00")
         log_path = os.path.join(output_folder, "ZoneSculpt_output_log.txt")
         try:
@@ -1132,7 +1093,11 @@ class ZoneSculptPlugin:
                     log_file.write("CRS warning:\n" + crs_warning)
                 log_file.write(f"Source CRS used: {source_crs.authid() or source_crs.description()}\n")
                 log_file.write(f"Boundary CRS used: {mask_crs.authid() or mask_crs.description()}\n")
-                log_file.write(f"Target CRS used: {(output_crs.authid() or output_crs.description()) if output_crs else ''}\n")
+                log_file.write(f"Reproject output: {reproject_output}\n")
+                log_file.write(f"Requested Target CRS: {(output_crs.authid() or output_crs.description()) if reproject_output else 'Not enabled'}\n")
+                log_file.write(f"Effective GeoTIFF/export CRS: {effective_output_crs.authid() or effective_output_crs.description()}\n")
+                if export_mbtiles:
+                    log_file.write("Effective MBTiles CRS: EPSG:3857 (MBTiles standard)\n")
                 log_file.write(f"Total jobs: {len(jobs)}\n")
         except Exception:
             pass
@@ -1155,8 +1120,14 @@ class ZoneSculptPlugin:
                     used_names.add(os.path.basename(master_path).lower())
                     job_outputs = []
 
+                    job_start_progress = 20 + int(((idx - 1) / len(jobs)) * 75)
+                    job_end_progress = 20 + int((idx / len(jobs)) * 75)
+                    master_progress = job_start_progress + max(
+                        1, (job_end_progress - job_start_progress) // 2
+                    )
+
                     dlg.status_label.setText(f"Processing {idx}/{len(jobs)}: creating master GeoTIFF {os.path.basename(master_path)}")
-                    dlg.progress.setValue(idx - 1)
+                    dlg.progress.setValue(job_start_progress)
                     QApplication.processEvents()
 
                     if dlg.cancel_requested:
@@ -1173,7 +1144,7 @@ class ZoneSculptPlugin:
                     # warp step failed with "clip_1.tif not found". This version lets GDAL Warp clip
                     # and reproject in one step, writing directly to the final master file.
                     clip_output = master_path
-                    clip_target_crs = output_crs if reproject_output and output_crs.isValid() else mask_crs
+                    clip_target_crs = effective_output_crs
 
                     clip_params = {
                         "INPUT": raster.source(),
@@ -1203,9 +1174,18 @@ class ZoneSculptPlugin:
                     if not os.path.exists(master_path):
                         raise RuntimeError(f"Master GeoTIFF was not created: {master_path}")
 
+                    self._prepare_cross_gis_raster(
+                        master_path,
+                        raster.source(),
+                        effective_output_crs,
+                    )
+                    self._verify_raster_crs(master_path, effective_output_crs, "GeoTIFF master")
+
                     outputs.append(master_path)
                     job_outputs.append(master_path)
                     self._append_log(log_path, f"CREATED MASTER: {master_path}")
+                    dlg.progress.setValue(min(master_progress, job_end_progress))
+                    QApplication.processEvents()
 
                     primary_key = output_format.get("key")
                     if primary_key != "gtiff":
@@ -1219,6 +1199,13 @@ class ZoneSculptPlugin:
                             break
                         if not os.path.exists(primary_path):
                             raise RuntimeError(f"Optional output was not created: {primary_path}")
+                        self._prepare_cross_gis_raster(
+                            primary_path,
+                            master_path,
+                            effective_output_crs,
+                        )
+                        self._write_esri_prj_sidecar(primary_path, effective_output_crs)
+                        self._verify_raster_crs(primary_path, effective_output_crs, "optional export")
                         outputs.append(primary_path)
                         job_outputs.append(primary_path)
                         self._append_log(log_path, f"CREATED EXPORT: {primary_path}")
@@ -1237,7 +1224,7 @@ class ZoneSculptPlugin:
                             QApplication.processEvents()
                             mb_warp_params = {
                                 "INPUT": master_path,
-                                "SOURCE_CRS": output_crs if reproject_output and output_crs.isValid() else mask_crs,
+                                "SOURCE_CRS": effective_output_crs,
                                 "TARGET_CRS": QgsCoordinateReferenceSystem("EPSG:3857"),
                                 "RESAMPLING": 0,
                                 "NODATA": None,
@@ -1250,10 +1237,17 @@ class ZoneSculptPlugin:
                                 "EXTRA": "",
                                 "OUTPUT": mercator_path,
                             }
-                            if not self._warp_reproject_direct(dlg, master_path, mercator_path, output_crs if reproject_output and output_crs.isValid() else mask_crs, QgsCoordinateReferenceSystem("EPSG:3857"), master_options):
+                            mbtiles_crs = QgsCoordinateReferenceSystem("EPSG:3857")
+                            if not self._warp_reproject_direct(dlg, master_path, mercator_path, effective_output_crs, mbtiles_crs, master_options):
                                 canceled = True
                                 self._cleanup_partial_outputs([mercator_path, mbtiles_path], outputs)
                                 break
+                            self._prepare_cross_gis_raster(
+                                mercator_path,
+                                master_path,
+                                mbtiles_crs,
+                            )
+                            self._verify_raster_crs(mercator_path, mbtiles_crs, "MBTiles preparation")
                             dlg.status_label.setText(f"Processing {idx}/{len(jobs)}: exporting MBTiles {os.path.basename(mbtiles_path)}")
                             QApplication.processEvents()
                             if dlg.cancel_requested:
@@ -1265,18 +1259,16 @@ class ZoneSculptPlugin:
                                 raise RuntimeError(f"MBTiles export was not created: {mbtiles_path}")
                             if not self._is_valid_mbtiles(mbtiles_path):
                                 raise RuntimeError(f"MBTiles export was created but is not a valid MBTiles database: {mbtiles_path}")
+                            self._verify_raster_crs(mbtiles_path, mbtiles_crs, "MBTiles")
                             outputs.append(mbtiles_path)
                             job_outputs.append(mbtiles_path)
                             self._append_log(log_path, f"CREATED MBTILES: {mbtiles_path}")
 
                     if load_outputs:
                         for path in job_outputs:
-                            layer_name = os.path.splitext(os.path.basename(path))[0]
-                            clipped = QgsRasterLayer(path, layer_name)
-                            if clipped.isValid():
-                                QgsProject.instance().addMapLayer(clipped)
+                            self._add_output_layer(path, raster)
 
-                    dlg.progress.setValue(idx)
+                    dlg.progress.setValue(min(95, job_end_progress))
                     QApplication.processEvents()
 
             if canceled:
@@ -1296,7 +1288,11 @@ class ZoneSculptPlugin:
                     self.iface.messageBar().pushWarning(PLUGIN_NAME, warning)
                     self._append_log(log_path, f"WARNING: {warning}")
 
+            dlg.progress.setValue(97)
+            dlg.status_label.setText("Finalizing completed outputs...")
+            QApplication.processEvents()
             self.activation_manager.record_successful_export()
+            dlg.progress.setValue(100)
             dlg.status_label.setText(f"Completed. {len(outputs)} file(s) were created in: {output_folder}")
             dlg._set_header_status("Completed", f"Outputs: {len(outputs)} file", "#0a7a33")
             self.iface.messageBar().pushSuccess(PLUGIN_NAME, f"Created {len(outputs)} output file(s).")
@@ -1306,13 +1302,13 @@ class ZoneSculptPlugin:
             QMessageBox.information(dlg, PLUGIN_NAME, f"Created {len(outputs)} output file(s).\n\nOutput directory:\n{output_folder}{warning_text}")
         except Exception as exc:
             dlg._set_header_status("Error", "Check message details", "#c62828")
-            QgsMessageLog.logMessage(str(exc), PLUGIN_NAME, Qgis.Critical)
+            QgsMessageLog.logMessage(str(exc), PLUGIN_NAME, QGIS_CRITICAL)
             self.iface.messageBar().pushCritical(PLUGIN_NAME, f"Failed: {exc}")
             QMessageBox.critical(dlg, PLUGIN_NAME, f"Process failed:\n{exc}")
         finally:
             dlg.is_running = False
             dlg.current_feedback = None
-            dlg._sync_activation_controls()
+            dlg.run_button.setEnabled(True)
             dlg.cancel_button.setEnabled(False)
             if (
                 "Completed" not in dlg.header_status_label.text()
@@ -1351,7 +1347,7 @@ class ZoneSculptPlugin:
             )
             # QGIS versions return different tuple layouts. Error code is normally first item.
             error_code = result[0] if isinstance(result, tuple) else result
-            if error_code == QgsVectorFileWriter.NoError:
+            if error_code == VECTOR_WRITER_NO_ERROR:
                 return True, "mask"
         except Exception:
             pass
@@ -1366,7 +1362,7 @@ class ZoneSculptPlugin:
                 "GPKG",
             )
             error_code = result[0] if isinstance(result, tuple) else result
-            if error_code == QgsVectorFileWriter.NoError:
+            if error_code == VECTOR_WRITER_NO_ERROR:
                 return True, "mask"
         except Exception as exc:
             raise RuntimeError(f"Failed to save temporary AOI mask for GDAL clipping: {exc}")
@@ -1396,31 +1392,27 @@ class ZoneSculptPlugin:
                 pass
 
         creation_options = self._creation_options_list(options)
+        grid_options = self._native_grid_options(gdal, input_path, source_crs, target_crs)
+        common_warp_options = {
+            "format": "GTiff",
+            "srcSRS": self._crs_to_gdal_srs(source_crs),
+            "dstSRS": self._crs_to_gdal_srs(target_crs),
+            "cutlineDSName": mask_path,
+            "cutlineLayer": layer_name,
+            "cropToCutline": True,
+            "multithread": True,
+            "creationOptions": creation_options,
+            "resampleAlg": "near",
+        }
+        common_warp_options.update(grid_options)
         try:
             warp_options = gdal.WarpOptions(
-                format="GTiff",
-                srcSRS=self._crs_to_gdal_srs(source_crs),
-                dstSRS=self._crs_to_gdal_srs(target_crs),
-                cutlineDSName=mask_path,
-                cutlineLayer=layer_name,
                 cutlineSRS=self._crs_to_gdal_srs(mask_layer.crs()),
-                cropToCutline=True,
-                multithread=True,
-                creationOptions=creation_options,
-                resampleAlg="near",
+                **common_warp_options,
             )
         except TypeError:
-            warp_options = gdal.WarpOptions(
-                format="GTiff",
-                srcSRS=self._crs_to_gdal_srs(source_crs),
-                dstSRS=self._crs_to_gdal_srs(target_crs),
-                cutlineDSName=mask_path,
-                cutlineLayer=layer_name,
-                cropToCutline=True,
-                multithread=True,
-                creationOptions=creation_options,
-                resampleAlg="near",
-            )
+            # Older GDAL builds do not expose cutlineSRS in WarpOptions.
+            warp_options = gdal.WarpOptions(**common_warp_options)
 
         try:
             result = gdal.Warp(output_path, input_path, options=warp_options)
@@ -1448,6 +1440,277 @@ class ZoneSculptPlugin:
             )
         result = None
         return not dlg.cancel_requested
+
+    def _native_grid_options(self, gdal, input_path, source_crs, target_crs):
+        """Keep the source pixel size/grid when clipping without reprojection."""
+        if not source_crs or not target_crs or source_crs != target_crs:
+            return {}
+
+        dataset = None
+        try:
+            dataset = gdal.Open(input_path)
+            if dataset is None:
+                return {}
+            transform = dataset.GetGeoTransform()
+            if not transform or len(transform) < 6:
+                return {}
+            if abs(float(transform[2])) > 1e-12 or abs(float(transform[4])) > 1e-12:
+                return {}
+            pixel_width = abs(float(transform[1]))
+            pixel_height = abs(float(transform[5]))
+            if pixel_width <= 0 or pixel_height <= 0:
+                return {}
+            return {
+                "xRes": pixel_width,
+                "yRes": pixel_height,
+                "targetAlignedPixels": True,
+            }
+        except Exception:
+            return {}
+        finally:
+            dataset = None
+
+    def _prepare_cross_gis_raster(self, output_path, reference_path, expected_crs):
+        """Embed CRS, band roles and stable statistics for non-QGIS readers.
+
+        QGIS stores renderer/stretch settings in a QML style.  ArcMap does not
+        read that style and otherwise calculates a new stretch for every clip,
+        which can make an unchanged image look pale.  The pixel values are not
+        modified here; portable raster metadata is copied instead.
+        """
+        try:
+            from osgeo import gdal
+
+            output_ds = gdal.Open(output_path, gdal.GA_Update)
+            if output_ds is None:
+                QgsMessageLog.logMessage(
+                    f"Cross-GIS metadata could not be written to: {output_path}",
+                    PLUGIN_NAME,
+                    QGIS_WARNING,
+                )
+                return
+
+            expected_wkt = expected_crs.toWkt() if expected_crs and expected_crs.isValid() else ""
+            if expected_wkt:
+                output_ds.SetProjection(expected_wkt)
+                output_ds.SetMetadataItem(
+                    "ZONESCULPT_OUTPUT_CRS",
+                    expected_crs.authid() or expected_crs.description(),
+                )
+
+            reference_ds = gdal.Open(self._source_path(reference_path))
+            if reference_ds is not None:
+                for band_number in range(1, min(output_ds.RasterCount, reference_ds.RasterCount) + 1):
+                    source_band = reference_ds.GetRasterBand(band_number)
+                    output_band = output_ds.GetRasterBand(band_number)
+                    if source_band is None or output_band is None:
+                        continue
+
+                    try:
+                        output_band.SetColorInterpretation(source_band.GetColorInterpretation())
+                    except Exception:
+                        pass
+
+                    try:
+                        color_table = source_band.GetColorTable()
+                        if color_table is not None:
+                            output_band.SetColorTable(color_table.Clone())
+                    except Exception:
+                        pass
+
+                    try:
+                        no_data = source_band.GetNoDataValue()
+                        if no_data is not None:
+                            output_band.SetNoDataValue(no_data)
+                    except Exception:
+                        pass
+
+                    # Reuse existing source statistics when available.  Do not
+                    # force a full scan of very large imagery during clipping.
+                    try:
+                        statistics = source_band.GetStatistics(True, False)
+                        if (
+                            statistics
+                            and len(statistics) == 4
+                            and statistics[0] is not None
+                            and float(statistics[1]) > float(statistics[0])
+                            and float(statistics[3]) >= 0
+                        ):
+                            output_band.SetStatistics(*statistics)
+                    except Exception:
+                        pass
+
+                    for getter_name, setter_name in (
+                        ("GetScale", "SetScale"),
+                        ("GetOffset", "SetOffset"),
+                        ("GetUnitType", "SetUnitType"),
+                    ):
+                        try:
+                            value = getattr(source_band, getter_name)()
+                            if value not in (None, ""):
+                                getattr(output_band, setter_name)(value)
+                        except Exception:
+                            pass
+
+                reference_ds = None
+
+            output_ds.FlushCache()
+            output_ds = None
+        except Exception as exc:
+            QgsMessageLog.logMessage(
+                f"Cross-GIS raster metadata warning for {output_path}: {exc}",
+                PLUGIN_NAME,
+                QGIS_WARNING,
+            )
+
+    def _write_esri_prj_sidecar(self, output_path, crs):
+        """Write an ESRI WKT sidecar for formats whose world file has no CRS."""
+        if os.path.splitext(output_path)[1].lower() not in {".png", ".jpg", ".jpeg"}:
+            return
+        if not crs or not crs.isValid():
+            return
+        try:
+            from osgeo import osr
+
+            spatial_ref = osr.SpatialReference()
+            spatial_ref.ImportFromWkt(crs.toWkt())
+            spatial_ref.MorphToESRI()
+            prj_path = os.path.splitext(output_path)[0] + ".prj"
+            with open(prj_path, "w", encoding="utf-8") as prj_file:
+                prj_file.write(spatial_ref.ExportToWkt())
+        except Exception as exc:
+            QgsMessageLog.logMessage(
+                f"ESRI projection sidecar could not be created for {output_path}: {exc}",
+                PLUGIN_NAME,
+                QGIS_WARNING,
+            )
+
+    def _verify_raster_crs(self, raster_path, expected_crs, label):
+        """Stop the run if an export was only relabelled or lost its CRS."""
+        try:
+            from osgeo import gdal, osr
+
+            dataset = gdal.Open(raster_path)
+            actual_wkt = dataset.GetProjectionRef() if dataset is not None else ""
+            dataset = None
+            if not actual_wkt:
+                prj_path = os.path.splitext(raster_path)[0] + ".prj"
+                if os.path.exists(prj_path):
+                    with open(prj_path, "r", encoding="utf-8") as prj_file:
+                        actual_wkt = prj_file.read()
+            if not actual_wkt:
+                raise RuntimeError(f"{label} has no readable coordinate reference system: {raster_path}")
+
+            actual_ref = osr.SpatialReference()
+            expected_ref = osr.SpatialReference()
+            actual_ref.ImportFromWkt(actual_wkt)
+            expected_ref.ImportFromWkt(expected_crs.toWkt())
+            if not bool(actual_ref.IsSame(expected_ref)):
+                actual_name = actual_ref.GetName() or "unknown"
+                expected_name = expected_crs.authid() or expected_crs.description()
+                raise RuntimeError(
+                    f"{label} CRS verification failed. Expected {expected_name}, but the file reports {actual_name}."
+                )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Unable to verify {label} CRS: {exc}")
+
+    def _add_output_layer(self, output_path, source_layer):
+        """Load an output and retain the source raster's visible QGIS style."""
+        layer_name = os.path.splitext(os.path.basename(output_path))[0]
+        output_layer = QgsRasterLayer(output_path, layer_name)
+        if not output_layer.isValid():
+            return False
+
+        # Add first, because project insertion may initialize a provider style.
+        # The complete source style is deliberately applied afterwards.
+        QgsProject.instance().addMapLayer(output_layer)
+        style_applied = False
+        try:
+            if source_layer is not None:
+                source_style = QgsMapLayerStyle()
+                source_style.readFromLayer(source_layer)
+                if source_style.isValid():
+                    source_style.writeToLayer(output_layer)
+                    style_applied = True
+        except Exception as exc:
+            QgsMessageLog.logMessage(
+                f"Complete source style could not be copied to the output raster: {exc}",
+                PLUGIN_NAME,
+                QGIS_WARNING,
+            )
+
+        # Renderer cloning is retained as a QGIS-version-safe fallback and also
+        # refreshes provider-dependent band links after applying the full style.
+        try:
+            source_renderer = source_layer.renderer() if source_layer else None
+            if source_renderer is not None:
+                output_layer.setRenderer(source_renderer.clone())
+                style_applied = True
+        except Exception as exc:
+            QgsMessageLog.logMessage(
+                f"Output renderer could not be copied from the source raster: {exc}",
+                PLUGIN_NAME,
+                QGIS_WARNING,
+            )
+
+        try:
+            source_filter = source_layer.brightnessFilter() if source_layer else None
+            output_filter = output_layer.brightnessFilter()
+            if source_filter is not None and output_filter is not None:
+                for getter_name, setter_name in (
+                    ("brightness", "setBrightness"),
+                    ("contrast", "setContrast"),
+                    ("gamma", "setGamma"),
+                ):
+                    getter = getattr(source_filter, getter_name, None)
+                    setter = getattr(output_filter, setter_name, None)
+                    if callable(getter) and callable(setter):
+                        setter(getter())
+        except Exception as exc:
+            QgsMessageLog.logMessage(
+                f"Output brightness settings could not be copied: {exc}",
+                PLUGIN_NAME,
+                QGIS_WARNING,
+            )
+
+        try:
+            if source_layer is not None:
+                output_layer.setBlendMode(source_layer.blendMode())
+        except Exception:
+            pass
+
+        # Store a sidecar/default QML style so reopening the output later does
+        # not make QGIS calculate a different automatic stretch again.
+        if style_applied:
+            try:
+                style_uri = output_layer.styleURI()
+                if style_uri:
+                    save_result = output_layer.saveNamedStyle(style_uri)
+                    if isinstance(save_result, tuple) and len(save_result) > 1 and not save_result[1]:
+                        QgsMessageLog.logMessage(
+                            f"Output style sidecar could not be saved: {save_result[0]}",
+                            PLUGIN_NAME,
+                            QGIS_WARNING,
+                        )
+            except Exception as exc:
+                QgsMessageLog.logMessage(
+                    f"Output style sidecar could not be saved: {exc}",
+                    PLUGIN_NAME,
+                    QGIS_WARNING,
+                )
+
+        output_layer.triggerRepaint()
+        try:
+            self.iface.layerTreeView().refreshLayerSymbology(output_layer.id())
+        except Exception:
+            pass
+        try:
+            self.iface.mapCanvas().refresh()
+        except Exception:
+            pass
+        return True
 
     def _translate_raster_direct(self, dlg, input_path, output_path, options):
         if dlg.cancel_requested:
@@ -1593,6 +1856,7 @@ class ZoneSculptPlugin:
                 "version": "1.1",
                 "description": "Created by ZoneSculpt",
                 "format": fmt,
+                "crs": "EPSG:3857",
             }
             for key, value in values.items():
                 if key in existing:

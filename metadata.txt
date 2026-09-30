@@ -1,12 +1,12 @@
 [general]
 name=ZoneSculpt
 qgisMinimumVersion=3.22
-qgisMaximumVersion=4.99
-description=Batch clip georeferenced rasters with polygon AOI boundaries and flexible output controls.
-version=26.5.0
-author=Dwi Purwanto
+qgisMaximumVersion=3.99
+description=Batch clip georeferenced rasters using polygon AOI boundaries.
+version=26.01
+author=Dwi Purwanto (Ruang Spasial)
 email=ruangspasial@gmail.com
-about=ZoneSculpt clips georeferenced rasters using polygon AOI features, creates a master GeoTIFF for each job, and can export PNG, JPEG, JPEG2000, VRT, or MBTiles outputs. It provides naming-field controls, optional feature grouping, CRS validation and reprojection, overlap preflight checks, progress reporting, and cancellation. Optional output availability depends on the GDAL drivers included with QGIS.
+about=ZoneSculpt clips a raster into separate outputs from polygon AOI features. It supports selected features, attribute-based naming and grouping, GeoTIFF master output, optional PNG, JPEG, JPEG2000, VRT, tiled GeoPackage, or MBTiles export, verified CRS transformation, portable raster display metadata, output loading, cancellation, and live 0-100 percent progress.
 category=Raster
 icon=icon.png
 homepage=https://github.com/purwantodwigeo10/ZoneSculpt#readme
@@ -17,9 +17,13 @@ experimental=False
 deprecated=False
 server=False
 hasProcessingProvider=False
-tags=raster,clip,aoi,geotiff,mbtiles,reprojection,batch
-changelog=26.5.0
-    Added batch raster clipping with polygon AOI boundaries and naming-field controls.
-    Added GeoTIFF master output with optional PNG, JPEG, JPEG2000, VRT, and MBTiles exports.
-    Improved CRS validation, reprojection, overlap checks, progress reporting, and cancellation.
-    Added sample boundary data and clearer usage documentation.
+tags=raster,clip,aoi,geotiff,geopackage,mbtiles,reprojection,batch
+changelog=26.01
+    Clip rasters in batches using polygon AOI features or selected boundaries.
+    Name or group outputs from an AOI attribute and create a GeoTIFF master for every job.
+    Export optional PNG, JPEG, JPEG2000, VRT, or MBTiles copies and load results into QGIS.
+    Apply the selected Target CRS to every non-MBTiles output and create standards-compatible EPSG:3857 MBTiles.
+    Add tiled GeoPackage output for a tile database that keeps the selected Target CRS.
+    Retain Source CRS when transformation is disabled and verify the CRS written to each result.
+    Preserve the source pixel grid and write portable raster display metadata for QGIS, ArcMap, and other GIS software.
+    Show cancellable 0-100 percent progress from validation through completed output creation.

@@ -1,62 +1,71 @@
 # ZoneSculpt
 
-ZoneSculpt is a QGIS plugin for batch clipping georeferenced raster data with
-polygon areas of interest (AOIs). Each AOI feature can create a separately
-named output, or features can be merged by a selected attribute value.
+ZoneSculpt is a QGIS raster tool for clipping one georeferenced raster into
+separate outputs using polygon AOI features. Each selected polygon, or each
+group of polygons sharing an attribute value, can produce its own named
+output.
 
-## Features
+## Requirements
 
-- clip a raster with selected or all polygon AOI features;
-- use an AOI attribute as the output filename;
-- merge AOI features that share the same field value;
-- create a master GeoTIFF for every clipping job;
-- optionally export PNG, JPEG, JPEG2000, VRT, or MBTiles;
-- validate source, boundary, and target coordinate reference systems;
-- reproject output and handle LOCAL/unsupported raster CRS fallbacks;
-- check raster and AOI overlap before processing;
-- report progress, support cancellation, and retain completed outputs; and
-- optionally add finished outputs to the current QGIS project.
+- QGIS 3.22 through QGIS 3.99.
+- A georeferenced raster supported by the GDAL build included with QGIS.
+- A polygon or multipolygon AOI layer with a field suitable for output names.
 
-Optional formats depend on the GDAL drivers available in the installed QGIS
-build. A projected CRS is recommended when accurate spatial dimensions matter.
+## Main workflow
+
+1. Load the source raster and polygon AOI layer in QGIS, or select them from files.
+2. Choose the AOI naming field and whether to use selected features only.
+3. Optionally merge AOI features that have the same field value.
+4. Confirm the source, boundary, and optional target CRS.
+5. Choose an output folder, filename prefix, and output format.
+6. Click **Run Clip** and follow the 0–100 percent progress indicator.
+
+ZoneSculpt always creates a GeoTIFF master for a completed clip job. It can
+also export PNG, JPEG, JPEG2000, VRT, tiled GeoPackage, or MBTiles when the
+corresponding GDAL driver is available. Completed outputs may be added directly to the current
+QGIS project. When **Add Output to Project** is enabled, the result inherits
+the complete source layer style, including its renderer, stretch, brightness,
+contrast, gamma, opacity, and blend mode. ZoneSculpt also stores that output
+style for later QGIS sessions and writes portable band, colour-role,
+statistics, and projection metadata for other GIS software. Display appearance
+can still vary because ArcMap, QGIS, and Global Mapper use different automatic
+raster-stretch rules; the source pixel values remain unchanged.
+
+## CRS handling
+
+The plugin validates the raster, boundary, and target CRS before processing.
+When a raster is reported as LOCAL or unsupported, the selected boundary CRS
+can be used as the source-coordinate assumption. When **Reproject Output** is
+enabled, the GeoTIFF master and PNG, JPEG, JPEG2000, or VRT export use the
+selected Target CRS. When it is disabled, the output keeps the Source CRS even
+when the boundary uses another CRS. MBTiles is always written in EPSG:3857, as
+required for standard web-map tile compatibility. Reprojection is performed
+on the pixels during clipping rather than merely changing the CRS label. The
+**Tiled GeoPackage (.gpkg)** option is provided when a tiled database must keep
+the selected Target CRS instead of Web Mercator. The
+overlap preflight remains non-blocking for sources whose extent cannot be
+reliably interpreted before GDAL runs. Clipping without a CRS change also
+retains the native source pixel size and aligns the output grid to that
+resolution.
+
+## Trial and activation
+
+Five successful clipping batches are available in trial mode. A successful
+batch is counted once, regardless of the number of AOI outputs in that batch.
+Use **Manage Activation** in the plugin window when continued use requires
+activation.
 
 ## Installation
 
-1. Open **Plugins > Manage and Install Plugins > Install from ZIP** in QGIS.
-2. Select the ZoneSculpt release ZIP and click **Install Plugin**.
-3. Open **Raster > ZoneSculpt** or use the ZoneSculpt toolbar button.
+1. Open **Plugins > Manage and Install Plugins** in QGIS.
+2. Choose **Install from ZIP**.
+3. Select the ZoneSculpt ZIP package and install it.
+4. Open ZoneSculpt from the **Raster** menu or its toolbar button.
 
-## Quick test
-
-1. Load a georeferenced raster in QGIS.
-2. Load `sample_data/clip_boundary.geojson`, or use another polygon layer that
-   overlaps the raster.
-3. Select the raster and polygon layer in ZoneSculpt.
-4. Choose `name` as the naming field.
-5. Confirm the source and boundary CRS values.
-6. Select an output directory and run the clip.
-7. Verify that a GeoTIFF master and the output log are created.
-
-The supplied boundary is synthetic and uses EPSG:4326. Move or replace it when
-testing a raster located elsewhere.
-
-## Activation and privacy
-
-ZoneSculpt includes five successful trial runs per device. A trial is consumed
-only after an export batch completes successfully. Activation requests and
-license-status checks use the RUANG SPASIAL License Hub over HTTPS.
-
-Only product identification, the activation code, Device ID, and computer name
-are transmitted for activation. Raster files, AOI geometry, attributes, file
-paths, and output data are not uploaded.
-
-## Source, issues, and support
+## Source and support
 
 - Source: <https://github.com/purwantodwigeo10/ZoneSculpt>
 - Issues: <https://github.com/purwantodwigeo10/ZoneSculpt/issues>
-- Activation request: <https://aktivasi.ruangspasial.my.id/request>
-- Support: <ruangspasial@gmail.com>
 
-Copyright (C) 2026 Dwi Purwanto / RuangSpasial. Licensed under
+Copyright (C) 2026 Dwi Purwanto / Ruang Spasial. Licensed under
 GPL-3.0-or-later; see `LICENSE`.
-
