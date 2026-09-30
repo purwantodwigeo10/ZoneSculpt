@@ -121,6 +121,55 @@ PLUGIN_COMPAT_MAX_QGIS = "3.99"
 
 DEFAULT_ACTIVATION_SERVER_URL = "https://aktivasi.ruangspasial.my.id"
 REQUEST_ACTIVATION_URL = "https://aktivasi.ruangspasial.my.id/request"
+ALLOWED_REMOTE_HOSTS = frozenset({"aktivasi.ruangspasial.my.id"})
+
+
+def _validated_https_url(url):
+    """Return an allowlisted HTTPS URL or raise ValueError.
+
+    This blocks file:, ftp:, custom schemes, embedded credentials, unexpected
+    ports, and redirects to hosts outside the Ruang Spasial License Hub.
+    """
+    parsed = urllib.parse.urlsplit(str(url or "").strip())
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme.lower() != "https":
+        raise ValueError("Only HTTPS connections are permitted.")
+    if hostname not in ALLOWED_REMOTE_HOSTS:
+        raise ValueError("The activation server host is not permitted.")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Credentials must not be embedded in a URL.")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("The activation server port is invalid.") from exc
+    if port not in (None, 443):
+        raise ValueError("Only the standard HTTPS port is permitted.")
+    return urllib.parse.urlunsplit(parsed)
+
+
+class _AllowlistedHttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject any redirect that leaves the HTTPS host allowlist."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validated_https_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_allowlisted_https(request, timeout):
+    """Open a request only after validating its URL, scheme, and redirects."""
+    request_url = request.full_url if isinstance(request, urllib.request.Request) else str(request)
+    _validated_https_url(request_url)
+    opener = urllib.request.build_opener(_AllowlistedHttpsRedirectHandler())
+    return opener.open(request, timeout=timeout)
+
+
+def _log_nonfatal(context, error):
+    """Record an optional-operation failure instead of silently hiding it."""
+    QgsMessageLog.logMessage(
+        f"{context}: {error}",
+        PLUGIN_NAME,
+        QGIS_WARNING,
+    )
 
 
 OUTPUT_FORMATS = [
@@ -205,7 +254,9 @@ class ActivationManager:
 
     def server_url(self):
         saved_url = str(self.settings.value("activation_server_url", DEFAULT_ACTIVATION_SERVER_URL) or DEFAULT_ACTIVATION_SERVER_URL).strip().rstrip("/")
-        if (not saved_url) or ("127.0.0.1" in saved_url) or ("localhost" in saved_url) or (":8000" in saved_url) or (":8001" in saved_url):
+        try:
+            saved_url = _validated_https_url(saved_url).rstrip("/")
+        except ValueError:
             saved_url = DEFAULT_ACTIVATION_SERVER_URL
             self.settings.setValue("activation_server_url", saved_url)
             self.settings.sync()
@@ -238,7 +289,10 @@ class ActivationManager:
         if not license_key:
             return False, "License key is empty."
 
-        endpoint = f"{server_url}/activate"
+        try:
+            endpoint = _validated_https_url(f"{server_url}/activate")
+        except ValueError as exc:
+            return False, f"Activation server URL is not permitted: {exc}"
         payload = {
             "product": PLUGIN_NAME,
             "plugin_code": PLUGIN_CODE,
@@ -254,7 +308,7 @@ class ActivationManager:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=15) as response:
+            with _open_allowlisted_https(request, timeout=15) as response:
                 raw = response.read().decode("utf-8", errors="replace")
                 result = json.loads(raw or "{}")
         except urllib.error.HTTPError as exc:
@@ -289,7 +343,11 @@ class ActivationManager:
             return False, "Aktivasi bukan untuk perangkat ini. Silakan ajukan request aktivasi baru."
 
         server_url = self.server_url().strip().rstrip("/")
-        endpoint = f"{server_url}/activate"
+        try:
+            endpoint = _validated_https_url(f"{server_url}/activate")
+        except ValueError as exc:
+            self.clear_activation()
+            return False, f"Activation server URL is not permitted: {exc}"
         payload = {
             "product": PLUGIN_NAME,
             "plugin_code": PLUGIN_CODE,
@@ -307,7 +365,7 @@ class ActivationManager:
         )
 
         try:
-            with urllib.request.urlopen(request, timeout=12) as response:
+            with _open_allowlisted_https(request, timeout=12) as response:
                 raw = response.read().decode("utf-8", errors="replace")
                 result = json.loads(raw or "{}")
         except urllib.error.HTTPError as exc:
@@ -749,8 +807,8 @@ class ZoneSculptDialog(QDialog):
         if self.current_feedback is not None:
             try:
                 self.current_feedback.cancel()
-            except Exception:
-                pass
+            except Exception as exc:
+                _log_nonfatal("Processing feedback could not be cancelled", exc)
 
     def _close_or_minimize(self):
         if self.is_running:
@@ -1099,8 +1157,8 @@ class ZoneSculptPlugin:
                 if export_mbtiles:
                     log_file.write("Effective MBTiles CRS: EPSG:3857 (MBTiles standard)\n")
                 log_file.write(f"Total jobs: {len(jobs)}\n")
-        except Exception:
-            pass
+        except OSError as exc:
+            _log_nonfatal("Output log could not be initialized", exc)
 
         if crs_warning:
             dlg.status_label.setText(crs_warning.strip())
@@ -1333,6 +1391,17 @@ class ZoneSculptPlugin:
             return crs.toWkt()
         return None
 
+    def _remove_existing_output(self, output_path):
+        """Remove only the exact output file that is about to be replaced."""
+        if not output_path or not os.path.exists(output_path):
+            return
+        try:
+            os.remove(output_path)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Existing output cannot be replaced: {output_path}. Close the file in other applications and try again. Detail: {exc}"
+            ) from exc
+
     def _save_mask_layer(self, mask_layer, output_path):
         try:
             options = QgsVectorFileWriter.SaveVectorOptions()
@@ -1349,8 +1418,8 @@ class ZoneSculptPlugin:
             error_code = result[0] if isinstance(result, tuple) else result
             if error_code == VECTOR_WRITER_NO_ERROR:
                 return True, "mask"
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_nonfatal("QGIS V3 mask writer was unavailable; using compatibility fallback", exc)
 
         # Fallback for older QGIS builds.
         try:
@@ -1385,11 +1454,7 @@ class ZoneSculptPlugin:
         mask_path = os.path.join(temp_dir, f"zonesculpt_mask_{uuid.uuid4().hex}.gpkg")
         _, layer_name = self._save_mask_layer(mask_layer, mask_path)
         input_path = self._source_path(input_source)
-        if os.path.exists(output_path):
-            try:
-                os.remove(output_path)
-            except Exception:
-                pass
+        self._remove_existing_output(output_path)
 
         creation_options = self._creation_options_list(options)
         grid_options = self._native_grid_options(gdal, input_path, source_crs, target_crs)
@@ -1508,22 +1573,22 @@ class ZoneSculptPlugin:
 
                     try:
                         output_band.SetColorInterpretation(source_band.GetColorInterpretation())
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _log_nonfatal(f"Band {band_number} colour interpretation could not be copied", exc)
 
                     try:
                         color_table = source_band.GetColorTable()
                         if color_table is not None:
                             output_band.SetColorTable(color_table.Clone())
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _log_nonfatal(f"Band {band_number} colour table could not be copied", exc)
 
                     try:
                         no_data = source_band.GetNoDataValue()
                         if no_data is not None:
                             output_band.SetNoDataValue(no_data)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _log_nonfatal(f"Band {band_number} NoData value could not be copied", exc)
 
                     # Reuse existing source statistics when available.  Do not
                     # force a full scan of very large imagery during clipping.
@@ -1537,8 +1602,8 @@ class ZoneSculptPlugin:
                             and float(statistics[3]) >= 0
                         ):
                             output_band.SetStatistics(*statistics)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _log_nonfatal(f"Band {band_number} statistics could not be copied", exc)
 
                     for getter_name, setter_name in (
                         ("GetScale", "SetScale"),
@@ -1549,8 +1614,11 @@ class ZoneSculptPlugin:
                             value = getattr(source_band, getter_name)()
                             if value not in (None, ""):
                                 getattr(output_band, setter_name)(value)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            _log_nonfatal(
+                                f"Band {band_number} metadata from {getter_name} could not be copied",
+                                exc,
+                            )
 
                 reference_ds = None
 
@@ -1678,8 +1746,8 @@ class ZoneSculptPlugin:
         try:
             if source_layer is not None:
                 output_layer.setBlendMode(source_layer.blendMode())
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_nonfatal("Output blend mode could not be copied", exc)
 
         # Store a sidecar/default QML style so reopening the output later does
         # not make QGIS calculate a different automatic stretch again.
@@ -1704,12 +1772,12 @@ class ZoneSculptPlugin:
         output_layer.triggerRepaint()
         try:
             self.iface.layerTreeView().refreshLayerSymbology(output_layer.id())
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_nonfatal("Layer-tree symbology could not be refreshed", exc)
         try:
             self.iface.mapCanvas().refresh()
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_nonfatal("Map canvas could not be refreshed", exc)
         return True
 
     def _translate_raster_direct(self, dlg, input_path, output_path, options):
@@ -1719,11 +1787,7 @@ class ZoneSculptPlugin:
             from osgeo import gdal
         except Exception as exc:
             raise RuntimeError(f"GDAL Python bindings are not available for raster export: {exc}")
-        if os.path.exists(output_path):
-            try:
-                os.remove(output_path)
-            except Exception:
-                pass
+        self._remove_existing_output(output_path)
         src = gdal.Open(input_path)
         if src is None:
             raise RuntimeError(f"Cannot open raster for export: {input_path}")
@@ -1745,11 +1809,7 @@ class ZoneSculptPlugin:
             from osgeo import gdal
         except Exception as exc:
             raise RuntimeError(f"GDAL Python bindings are not available for reprojection: {exc}")
-        if os.path.exists(output_path):
-            try:
-                os.remove(output_path)
-            except Exception:
-                pass
+        self._remove_existing_output(output_path)
         warp_options = gdal.WarpOptions(
             format="GTiff",
             srcSRS=self._crs_to_gdal_srs(source_crs),
@@ -1812,11 +1872,7 @@ class ZoneSculptPlugin:
         """Export a prepared EPSG:3857 GeoTIFF to a standards-friendly MBTiles file."""
         if not output_path.lower().endswith(".mbtiles"):
             output_path = f"{output_path}.mbtiles"
-        if os.path.exists(output_path):
-            try:
-                os.remove(output_path)
-            except Exception:
-                pass
+        self._remove_existing_output(output_path)
         try:
             from osgeo import gdal
         except Exception as exc:
@@ -1883,8 +1939,8 @@ class ZoneSculptPlugin:
         try:
             with open(log_path, "a", encoding="utf-8") as log_file:
                 log_file.write(f"{line}\n")
-        except Exception:
-            pass
+        except OSError as exc:
+            _log_nonfatal("Output log could not be updated", exc)
 
     def _cleanup_partial_outputs(self, paths, completed_outputs):
         completed = {os.path.abspath(path) for path in completed_outputs}
@@ -1895,8 +1951,8 @@ class ZoneSculptPlugin:
                 abs_path = os.path.abspath(path)
                 if abs_path not in completed and os.path.exists(abs_path):
                     os.remove(abs_path)
-            except Exception:
-                pass
+            except OSError as exc:
+                _log_nonfatal(f"Partial output could not be removed: {path}", exc)
 
     def _build_jobs(self, features, field_name, group_by_field):
         if not group_by_field:
